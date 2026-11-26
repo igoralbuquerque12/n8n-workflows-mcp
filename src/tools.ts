@@ -1,7 +1,50 @@
 import type { Config } from "./config.js";
-import { droppedNodeKeyWarnings, N8nClient, type JsonObject, type N8nWorkflow } from "./n8nClient.js";
+import {
+  buildMatcher,
+  describeExecution,
+  executionStart,
+  findMatches,
+  summarizeExecution,
+  type TrimOptions,
+} from "./executions.js";
+import {
+  droppedNodeKeyWarnings,
+  N8nApiError,
+  N8nClient,
+  type ExecutionListQuery,
+  type JsonObject,
+  type N8nExecution,
+  type N8nWorkflow,
+} from "./n8nClient.js";
 import { applyPatch, validateWorkflow, type PatchOperation } from "./patch.js";
-import { assertReadAllowed, assertWriteAllowed, backupWorkflow, isProtected } from "./safety.js";
+import { AccessBlockedError, assertReadAllowed, assertWriteAllowed, backupWorkflow, isProtected } from "./safety.js";
+
+export interface SearchExecutionsQuery {
+  workflowId?: string;
+  status?: ExecutionListQuery["status"];
+  startedAfter?: string;
+  startedBefore?: string;
+  text?: string;
+  regex?: string;
+  nodes?: string[];
+  maxResults?: number;
+  scanLimit?: number;
+  cursor?: string;
+}
+
+const SEARCH_PAGE_SIZE = 50;
+const MATCHES_PER_EXECUTION = 5;
+
+function parseTime(name: string, raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const time = Date.parse(raw);
+  if (Number.isNaN(time)) throw new Error(`Invalid ${name} "${raw}" (expected an ISO date, e.g. 2026-11-25T14:00:00-03:00)`);
+  return time;
+}
+
+function workflowIdOf(execution: N8nExecution): string | null {
+  return execution.workflowId === undefined || execution.workflowId === null ? null : String(execution.workflowId);
+}
 
 export class Tools {
   private readonly client: N8nClient;
@@ -102,6 +145,147 @@ export class Tools {
     const current = await this.client.getWorkflow(id);
     assertWriteAllowed(this.config, current.name, confirmProduction);
     return archived ? this.client.archiveWorkflow(id) : this.client.unarchiveWorkflow(id);
+  }
+
+  /** Workflow names by id, for one tool call. null means the workflow no longer exists. */
+  private nameLookup(): (workflowId: string | null) => Promise<string | null> {
+    const cache = new Map<string, Promise<string | null>>();
+    return (workflowId) => {
+      if (workflowId === null) return Promise.resolve(null);
+      let name = cache.get(workflowId);
+      if (!name) {
+        name = this.client.getWorkflow(workflowId).then(
+          (workflow) => workflow.name,
+          (error: unknown) => {
+            if (error instanceof N8nApiError && (error.status === 404 || error.status === 403)) return null;
+            throw error;
+          },
+        );
+        cache.set(workflowId, name);
+      }
+      return name;
+    };
+  }
+
+  /** With N8N_BLOCK_PROTECTED, executions of protected workflows (or of workflows that can no longer be checked) are hidden. */
+  private visible(workflowName: string | null): boolean {
+    if (!this.config.blockProtected) return true;
+    return workflowName !== null && !isProtected(this.config, workflowName);
+  }
+
+  async listExecutions(query: Omit<ExecutionListQuery, "includeData"> & { errorDetails?: boolean }) {
+    const { errorDetails, ...filters } = query;
+    const lookup = this.nameLookup();
+    if (filters.workflowId) assertReadAllowed(this.config, (await lookup(filters.workflowId)) ?? "");
+
+    const page = await this.client.listExecutions({
+      ...filters,
+      limit: filters.limit ?? 20,
+      includeData: errorDetails ?? filters.status === "error",
+    });
+    const executions = [];
+    for (const execution of page.data) {
+      const name = await lookup(workflowIdOf(execution));
+      if (this.visible(name)) executions.push(summarizeExecution(execution, name));
+    }
+    return { nextCursor: page.nextCursor ?? null, executions };
+  }
+
+  async getExecution(id: string, options: Partial<TrimOptions> & { nodes?: string[] }) {
+    const execution = await this.client.getExecution(id, true);
+    const workflowId = workflowIdOf(execution);
+    const name = await this.nameLookup()(workflowId);
+    if (!this.visible(name)) {
+      throw new AccessBlockedError(
+        name === null
+          ? `Execution ${id}: its workflow ${workflowId ?? "(unknown)"} no longer exists, so N8N_BLOCK_PROTECTED cannot be checked.`
+          : `Execution ${id} belongs to "${name}", which is protected and N8N_BLOCK_PROTECTED=true.`,
+      );
+    }
+    const detail = describeExecution(execution, {
+      itemsPerOutput: options.itemsPerOutput ?? 3,
+      maxStringLength: options.maxStringLength ?? 300,
+      nodes: options.nodes,
+    });
+    return { execution: summarizeExecution(execution, name), ...detail };
+  }
+
+  async searchExecutions(query: SearchExecutionsQuery) {
+    const matcher = buildMatcher(query.text, query.regex);
+    const after = parseTime("startedAfter", query.startedAfter);
+    const before = parseTime("startedBefore", query.startedBefore);
+    const maxResults = query.maxResults ?? 10;
+    const scanLimit = query.scanLimit ?? 300;
+    const lookup = this.nameLookup();
+    if (query.workflowId) assertReadAllowed(this.config, (await lookup(query.workflowId)) ?? "");
+
+    const results: JsonObject[] = [];
+    let scanned = 0;
+    let cursor = query.cursor;
+    let stoppedBecause: "maxResults" | "scanLimit" | "reachedStartedAfter" | "noMoreExecutions";
+
+    // n8n returns executions newest first and the cursor resumes after the last page read.
+    // Whole pages are processed, so the last page can push the results a little past maxResults.
+    for (;;) {
+      const page = await this.client.listExecutions({
+        workflowId: query.workflowId,
+        status: query.status,
+        includeData: matcher !== null,
+        limit: Math.min(SEARCH_PAGE_SIZE, scanLimit - scanned),
+        cursor,
+      });
+      scanned += page.data.length;
+      cursor = page.nextCursor ?? undefined;
+
+      let allOlder = after !== null && page.data.length > 0;
+      for (const execution of page.data) {
+        const start = executionStart(execution);
+        if (start === null || after === null || start >= after) allOlder = false;
+        if (after !== null && (start === null || start < after)) continue;
+        if (before !== null && (start === null || start > before)) continue;
+
+        const matches = matcher ? findMatches(execution, matcher, { nodes: query.nodes, limit: MATCHES_PER_EXECUTION }) : [];
+        if (matcher && matches.length === 0) continue;
+
+        const name = await lookup(workflowIdOf(execution));
+        if (!this.visible(name)) continue;
+        results.push({ ...summarizeExecution(execution, name), matches: matches as unknown as JsonObject[] });
+      }
+
+      if (allOlder) {
+        stoppedBecause = "reachedStartedAfter";
+        cursor = undefined;
+        break;
+      }
+      if (!cursor || page.data.length === 0) {
+        stoppedBecause = "noMoreExecutions";
+        cursor = undefined;
+        break;
+      }
+      if (results.length >= maxResults) {
+        stoppedBecause = "maxResults";
+        break;
+      }
+      if (scanned >= scanLimit) {
+        stoppedBecause = "scanLimit";
+        break;
+      }
+    }
+
+    return { scanned, stoppedBecause, nextCursor: cursor ?? null, results };
+  }
+
+  async retryExecution(id: string, options: { loadWorkflow?: boolean; confirmProduction?: boolean }) {
+    const execution = await this.client.getExecution(id, false);
+    const workflowId = workflowIdOf(execution);
+    const name = await this.nameLookup()(workflowId);
+    if (name === null) {
+      throw new Error(`Execution ${id}: workflow ${workflowId ?? "(unknown)"} no longer exists, so it cannot be retried.`);
+    }
+    assertWriteAllowed(this.config, name, options.confirmProduction);
+
+    const retried = await this.client.retryExecution(id, options.loadWorkflow);
+    return { retriedFrom: String(execution.id), execution: summarizeExecution(retried, name) };
   }
 
   async deleteWorkflow(id: string, confirmProduction?: boolean) {

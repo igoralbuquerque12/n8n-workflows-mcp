@@ -20,8 +20,13 @@ interface Stored extends JsonObject {
   id: string;
 }
 
-function startMockN8n(apiKey: string): Promise<{ server: Server; url: string; store: Map<string, Stored> }> {
+function startMockN8n(
+  apiKey: string,
+): Promise<{ server: Server; url: string; store: Map<string, Stored>; executions: Map<string, Stored>; executionPages: number[] }> {
   const store = new Map<string, Stored>();
+  const executions = new Map<string, Stored>();
+  // Page sizes requested on GET /executions, to check how far a search scanned.
+  const executionPages: number[] = [];
   let counter = 0;
 
   const readBody = (request: IncomingMessage) =>
@@ -39,7 +44,38 @@ function startMockN8n(apiKey: string): Promise<{ server: Server; url: string; st
     if (request.headers["x-n8n-api-key"] !== apiKey) return send(401, { message: "unauthorized" });
 
     const url = new URL(request.url ?? "/", "http://localhost");
-    const match = url.pathname.match(/^\/api\/v1\/workflows(?:\/([^/]+))?(?:\/(activate|deactivate|archive))?$/);
+
+    const executionRoute = url.pathname.match(/^\/api\/v1\/executions(?:\/([^/]+))?(\/retry)?$/);
+    if (executionRoute) {
+      const [, executionId, retry] = executionRoute;
+      const view = (execution: Stored) => (url.searchParams.get("includeData") === "true" ? execution : { ...execution, data: undefined });
+      if (request.method === "GET" && !executionId) {
+        const limit = Number(url.searchParams.get("limit") ?? 100);
+        const offset = Number(url.searchParams.get("cursor") ?? 0);
+        executionPages.push(limit);
+        const filtered = [...executions.values()]
+          .filter((execution) => !url.searchParams.has("workflowId") || execution.workflowId === url.searchParams.get("workflowId"))
+          .filter((execution) => !url.searchParams.has("status") || execution.status === url.searchParams.get("status"))
+          .sort((a, b) => Number(b.id) - Number(a.id));
+        const page = filtered.slice(offset, offset + limit);
+        return send(200, { data: page.map(view), nextCursor: offset + limit < filtered.length ? String(offset + limit) : null });
+      }
+      const found = executions.get(executionId ?? "");
+      if (!found) return send(404, { message: "not found" });
+      if (request.method === "GET" && !retry) return send(200, view(found));
+      if (request.method === "POST" && retry) {
+        if (found.status === "success") return send(409, { message: "The execution succeeded, so it cannot be retried." });
+        const body = JSON.parse((await readBody(request)) || "{}") as JsonObject;
+        const newId = String(Math.max(...[...executions.keys()].map(Number)) + 1);
+        const retried: Stored = { ...found, id: newId, status: "success", retryOf: found.id, mode: "retry", loadWorkflow: body.loadWorkflow ?? null };
+        executions.set(newId, retried);
+        found.retrySuccessId = newId;
+        return send(200, retried);
+      }
+      return send(405, { message: "method not allowed" });
+    }
+
+    const match =url.pathname.match(/^\/api\/v1\/workflows(?:\/([^/]+))?(?:\/(activate|deactivate|archive))?$/);
     if (!match) return send(404, { message: "not found" });
     const [, id, action] = match;
 
@@ -84,7 +120,9 @@ function startMockN8n(apiKey: string): Promise<{ server: Server; url: string; st
   });
 
   return new Promise((resolve) =>
-    server.listen(0, "127.0.0.1", () => resolve({ server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, store })),
+    server.listen(0, "127.0.0.1", () =>
+      resolve({ server, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, store, executions, executionPages }),
+    ),
   );
 }
 
@@ -272,14 +310,161 @@ await expectRejects(readOnly.setActive(prodCreated.id, true, true), /read-only/)
 await expectRejects(readOnly.createWorkflow(baseWorkflow("[Staging] Nope"), true), /read-only/);
 assert.equal((await readOnly.listWorkflows({})).workflows.length, n8n.store.size);
 
-const serverEntry = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "server.js");
+// ---- Executions ----
+n8n.store.set("w-exec", { ...baseWorkflow("[Staging] Atendimento"), id: "w-exec" } as Stored);
+n8n.store.set("w-prod-exec", { ...baseWorkflow("[Production] Atendimento"), id: "w-prod-exec" } as Stored);
+
+const item = (json: JsonObject) => ({ json, pairedItem: { item: 0 } });
+const run = (startTime: number, data: JsonObject, extra: JsonObject = {}) => ({
+  startTime,
+  executionTime: 12,
+  executionStatus: "success",
+  source: [],
+  data,
+  ...extra,
+});
+const execution = (id: number, workflowId: string, status: string, startedAt: string, runData: JsonObject, error?: JsonObject): Stored => ({
+  id: String(id),
+  workflowId,
+  status,
+  mode: "webhook",
+  finished: status === "success",
+  startedAt,
+  stoppedAt: new Date(Date.parse(startedAt) + 1500).toISOString(),
+  data: { resultData: { runData, lastNodeExecuted: Object.keys(runData).at(-1) ?? null, ...(error ? { error } : {}) } },
+});
+const webhookRun = (time: number, phone: string) => ({ Webhook: [run(time, { main: [[item({ body: { phone, name: "Ana" } })]] })] });
+
+// 60 old executions, then the four this test looks at (ids 61-64, newest last).
+for (let id = 1; id <= 60; id++) {
+  n8n.executions.set(String(id), execution(id, "w-exec", "success", `2026-11-23T10:${String(id % 60).padStart(2, "0")}:00.000Z`, webhookRun(0, `55110000${id}`)));
+}
+const t2 = Date.parse("2026-11-25T15:00:00.000Z");
+const httpError = { message: "Request failed with status code 500", description: "upstream down", httpCode: "500", node: { name: "HTTP Request" }, stack: "NodeApiError: Request failed\n    at HttpRequest.execute" };
+n8n.executions.set("61", execution(61, "w-exec", "success", "2026-11-24T10:00:00.000Z", webhookRun(0, "5511988887777")));
+n8n.executions.set("62", execution(62, "w-exec", "error", "2026-11-25T15:00:00.000Z", {
+  // Stored out of order: get_execution must sort by startTime.
+  "HTTP Request": [run(t2 + 30, {}, { executionStatus: "error", source: [{ previousNode: "IF", previousNodeOutput: 1 }], error: httpError })],
+  Webhook: [run(t2, { main: [[item({ body: { phone: "5511977776666", note: "x".repeat(1000) } }), item({ n: 2 }), item({ n: 3 }), item({ n: 4 })]] })],
+  IF: [run(t2 + 10, { main: [[], [{ json: { ok: true }, binary: { file: { fileName: "a.pdf", mimeType: "application/pdf", fileSize: "10 kB", data: "QUJD" } } }]] }, { source: [{ previousNode: "Webhook" }] })],
+}, httpError));
+n8n.executions.set("63", execution(63, "w-prod-exec", "success", "2026-11-25T16:00:00.000Z", webhookRun(0, "5511988887777")));
+n8n.executions.set("64", execution(64, "deleted-wf", "error", "2026-11-26T09:00:00.000Z", webhookRun(0, "5511988887777"), { message: "boom" }));
+
+const errors = await tools.listExecutions({ status: "error" });
+assert.deepEqual(errors.executions.map((entry) => entry.id), ["64", "62"]);
+const failed = errors.executions[1] as JsonObject;
+assert.equal(failed.workflowName, "[Staging] Atendimento");
+assert.equal(failed.durationMs, 1500);
+assert.deepEqual(failed.error, { node: "HTTP Request", message: "Request failed with status code 500", description: "upstream down", httpCode: "500" });
+assert.equal(errors.executions[0]?.workflowName, null);
+const plainPage = await tools.listExecutions({ workflowId: "w-exec", limit: 5 });
+assert.equal(plainPage.executions.length, 5);
+assert.equal(plainPage.nextCursor, "5");
+assert.equal("error" in (plainPage.executions[0] as JsonObject), false);
+
+const detail = await tools.getExecution("62", {});
+assert.deepEqual(detail.nodes.map((node) => node.node), ["Webhook", "IF", "HTTP Request"]);
+const [webhookStep, ifStep, httpStep] = detail.nodes as JsonObject[];
+const webhookOut = (webhookStep?.outputs as JsonObject[])[0] as JsonObject;
+assert.equal(webhookOut.itemCount, 4);
+assert.equal((webhookOut.items as JsonObject[]).length, 3);
+assert.match(JSON.stringify(webhookOut.items), /\[\+700 chars\]/);
+assert.equal(JSON.stringify(webhookOut.items).includes("pairedItem"), false);
+assert.deepEqual((ifStep?.outputs as JsonObject[]).map((output) => output.itemCount), [0, 1]);
+assert.deepEqual(ifStep?.from, ["Webhook"]);
+assert.deepEqual(((ifStep?.outputs as JsonObject[])[1]?.items as JsonObject[])[0], {
+  json: { ok: true },
+  binary: { file: { fileName: "a.pdf", mimeType: "application/pdf", fileSize: "10 kB" } },
+});
+assert.deepEqual(httpStep?.from, ["IF (output 1)"]);
+assert.equal((httpStep?.error as JsonObject).message, "Request failed with status code 500");
+assert.match(String(detail.errorStack), /NodeApiError/);
+const focused = await tools.getExecution("62", { nodes: ["Webhook", "Ghost"], itemsPerOutput: 1, maxStringLength: 2000 });
+assert.deepEqual(focused.nodes.map((node) => node.node), ["Webhook"]);
+assert.match(focused.warnings[0] ?? "", /Ghost/);
+assert.equal(JSON.stringify(focused.nodes).includes("[+"), false);
+
+const byPhone = await tools.searchExecutions({ text: "5511988887777" });
+assert.deepEqual(byPhone.results.map((result) => result.id), ["64", "63", "61"]);
+assert.equal(byPhone.stoppedBecause, "noMoreExecutions");
+assert.equal(byPhone.scanned, 64);
+assert.deepEqual((byPhone.results[2]?.matches as unknown as { node: string; path: string; snippet: string }[])[0], {
+  node: "Webhook",
+  path: "main[0][0].json.body.phone",
+  snippet: "5511988887777",
+});
+const firstOnly = await tools.searchExecutions({ text: "5511988887777", maxResults: 1 });
+assert.equal(firstOnly.stoppedBecause, "maxResults");
+assert.equal(firstOnly.nextCursor, "50");
+const rest = await tools.searchExecutions({ text: "5511988887777", cursor: firstOnly.nextCursor ?? undefined });
+assert.equal(rest.scanned, 14);
+assert.equal(rest.results.length, 0);
+
+n8n.executionPages.length = 0;
+const windowed = await tools.searchExecutions({ text: "55119888", startedAfter: "2026-11-25T00:00:00Z", startedBefore: "2026-11-25T23:59:59Z" });
+assert.deepEqual(windowed.results.map((result) => result.id), ["63"]);
+assert.equal(windowed.stoppedBecause, "reachedStartedAfter");
+assert.equal(windowed.nextCursor, null);
+assert.deepEqual(n8n.executionPages, [50, 50]);
+
+const byRegex = await tools.searchExecutions({ regex: "status code 5\\d\\d", workflowId: "w-exec" });
+assert.deepEqual(byRegex.results.map((result) => result.id), ["62"]);
+assert.deepEqual((byRegex.results[0]?.matches as unknown as { node: string; path: string }[]).map((m) => `${m.node}:${m.path}`), ["HTTP Request:error.message"]);
+const inNode = await tools.searchExecutions({ text: "5511977776666", nodes: ["IF"] });
+assert.equal(inNode.results.length, 0);
+const capped = await tools.searchExecutions({ text: "nothing-here", scanLimit: 10 });
+assert.equal(capped.scanned, 10);
+assert.equal(capped.stoppedBecause, "scanLimit");
+const byDate = await tools.searchExecutions({ startedAfter: "2026-11-26T00:00:00Z" });
+assert.deepEqual(byDate.results.map((result) => result.id), ["64"]);
+await expectRejects(tools.searchExecutions({ text: "a", regex: "a" }), /either text or regex/);
+await expectRejects(tools.searchExecutions({ regex: "(" }), /Invalid regex/);
+await expectRejects(tools.searchExecutions({ startedAfter: "ontem" }), /Invalid startedAfter/);
+
+const blockedIds = (await blocked.searchExecutions({ text: "5511988887777" })).results.map((result) => result.id);
+assert.deepEqual(blockedIds, ["61"]);
+assert.equal((await blocked.listExecutions({ status: "error" })).executions.length, 1);
+await expectRejects(blocked.getExecution("63", {}), /N8N_BLOCK_PROTECTED/);
+await expectRejects(blocked.getExecution("64", {}), /no longer exists/);
+await expectRejects(blocked.listExecutions({ workflowId: "w-prod-exec" }), /N8N_BLOCK_PROTECTED/);
+await expectRejects(blocked.retryExecution("63", { confirmProduction: true }), /N8N_BLOCK_PROTECTED/);
+
+const retried = await tools.retryExecution("62", { loadWorkflow: true });
+assert.equal(retried.retriedFrom, "62");
+assert.equal(retried.execution.retryOf, "62");
+assert.equal(retried.execution.workflowName, "[Staging] Atendimento");
+assert.equal(n8n.executions.get(String(retried.execution.id))?.loadWorkflow, true);
+await expectRejects(tools.retryExecution("61", {}), /409/);
+n8n.executions.set("63", { ...(n8n.executions.get("63") as Stored), status: "error" });
+await expectRejects(tools.retryExecution("63", {}), /needs explicit user approval/);
+await expectRejects(readOnly.retryExecution("62", { confirmProduction: true }), /read-only/);
+await expectRejects(tools.retryExecution("64", {}), /no longer exists/);
+
+const serverEntry =path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "server.js");
 const client = new Client({ name: "smoke", version: "0.0.0" });
 await client.connect(new StdioClientTransport({ command: process.execPath, args: [serverEntry], env: { ...env, PATH: process.env.PATH ?? "" } }));
 const listed = await client.listTools();
 assert.deepEqual(
   listed.tools.map((tool) => tool.name).sort(),
-  ["n8n_create_workflow", "n8n_delete_workflow", "n8n_get_workflow", "n8n_list_workflows", "n8n_patch_workflow", "n8n_set_workflow_active", "n8n_set_workflow_archived", "n8n_update_workflow"],
+  [
+    "n8n_create_workflow",
+    "n8n_delete_workflow",
+    "n8n_get_execution",
+    "n8n_get_workflow",
+    "n8n_list_executions",
+    "n8n_list_workflows",
+    "n8n_patch_workflow",
+    "n8n_retry_execution",
+    "n8n_search_executions",
+    "n8n_set_workflow_active",
+    "n8n_set_workflow_archived",
+    "n8n_update_workflow",
+  ],
 );
+const searchViaMcp = await client.callTool({ name: "n8n_search_executions", arguments: { text: "5511977776666" } });
+assert.notEqual(searchViaMcp.isError, true, JSON.stringify(searchViaMcp.content));
+assert.match(JSON.stringify(searchViaMcp.content), /\\"id\\": \\"62\\"/);
 const viaMcp = await client.callTool({
   name: "n8n_patch_workflow",
   arguments: { id: prodCreated.id, operations: [{ op: "setName", name: "[Production] Nope" }] },

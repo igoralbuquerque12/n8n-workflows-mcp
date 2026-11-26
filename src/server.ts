@@ -175,4 +175,88 @@ server.registerTool(
     respond(() => tools.deleteWorkflow(id, confirmed)),
 );
 
+const executionId = z.string().describe("Execution ID");
+const executionStatus = z
+  .enum(["canceled", "error", "running", "success", "waiting"])
+  .optional()
+  .describe("Only executions with this status");
+const nodeNames = z.array(z.string()).optional();
+
+server.registerTool(
+  "n8n_list_executions",
+  {
+    description:
+      "List one page of executions, newest first: id, workflow, status, mode, start, duration, and (with errorDetails) the failing node and error message. Use n8n_search_executions to filter by date or by content, and n8n_get_execution to see what each node received and produced.",
+    inputSchema: {
+      workflowId: z.string().optional().describe("Only executions of this workflow"),
+      status: executionStatus,
+      projectId: z.string().optional(),
+      limit: z.number().int().min(1).max(250).optional().describe("Default 20"),
+      cursor: z.string().optional().describe("nextCursor from the previous page"),
+      errorDetails: z
+        .boolean()
+        .optional()
+        .describe("Fetch execution data to report the failing node and error message (slower). Default: true when status is error"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  (query) => respond(() => tools.listExecutions(query)),
+);
+
+server.registerTool(
+  "n8n_get_execution",
+  {
+    description:
+      "Show one execution: summary, error and stack, and every node that ran in start order, with where its input came from, its status, timing, and the first items of each output (IF/Switch branches show as separate outputs; empty outputs have itemCount 0). Long strings and arrays are trimmed and binary content is replaced by file metadata. Use nodes to focus on a few nodes and raise itemsPerOutput or maxStringLength to see more.",
+    inputSchema: {
+      id: executionId,
+      nodes: nodeNames.describe("Only these node names (default: every node that ran)"),
+      itemsPerOutput: z.number().int().min(0).max(50).optional().describe("Items shown per node output. Default 3"),
+      maxStringLength: z.number().int().min(20).max(20_000).optional().describe("Longer strings are cut. Default 300"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  ({ id, ...options }) => respond(() => tools.getExecution(id, options)),
+);
+
+server.registerTool(
+  "n8n_search_executions",
+  {
+    description:
+      "Search past executions, newest first, by date range and/or by a value that appears in the data the nodes received or produced or in an error message (e.g. a phone number, order id, e-mail or error text). Matching is case-insensitive on JSON values, not keys or binary content; try the formats the value may be stored in (e.g. 5511988887777 vs (11) 98888-7777) or use regex. Each result lists where the value was found (node, path, snippet). Scanning stops at maxResults matches, scanLimit executions, or the first page older than startedAfter; pass nextCursor back to keep scanning.",
+    inputSchema: {
+      workflowId: z.string().optional().describe("Only executions of this workflow (much faster)"),
+      status: executionStatus,
+      startedAfter: z.string().optional().describe("ISO date-time, e.g. 2026-11-25T12:00:00-03:00"),
+      startedBefore: z.string().optional().describe("ISO date-time"),
+      text: z.string().optional().describe("Case-insensitive substring to look for"),
+      regex: z.string().optional().describe("Case-insensitive JavaScript regex, instead of text"),
+      nodes: nodeNames.describe("Only look in these nodes"),
+      maxResults: z.number().int().min(1).max(100).optional().describe("Default 10"),
+      scanLimit: z.number().int().min(1).max(5000).optional().describe("Max executions to read in this call. Default 300"),
+      cursor: z.string().optional().describe("nextCursor from a previous search with the same filters"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  (query) => respond(() => tools.searchExecutions(query)),
+);
+
+server.registerTool(
+  "n8n_retry_execution",
+  {
+    description:
+      "Retry a failed execution. This runs the workflow again with the original input, so any side effects (messages, e-mails, payments, API calls) happen again: tell the user what will run and get their approval first. n8n only retries executions that did not succeed.",
+    inputSchema: {
+      id: executionId,
+      loadWorkflow: z
+        .boolean()
+        .optional()
+        .describe("true runs the currently saved workflow; false (default) runs the workflow as it was when the execution happened"),
+      confirmProduction,
+    },
+    annotations: { destructiveHint: true, openWorldHint: true },
+  },
+  ({ id, ...options }) => respond(() => tools.retryExecution(id, options)),
+);
+
 await server.connect(new StdioServerTransport());
