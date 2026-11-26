@@ -1,0 +1,27 @@
+{
+  "name": "n8n-workflows-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that creates and edits n8n workflows through the n8n public REST API",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "n8n-workflows-mcp": "dist/server.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/server.js",
+    "test": "npm run build && node dist/test/smoke.js"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
