@@ -1,5 +1,5 @@
 import type { Config } from "./config.js";
-import { N8nClient, type JsonObject, type N8nWorkflow } from "./n8nClient.js";
+import { droppedNodeKeyWarnings, N8nClient, type JsonObject, type N8nWorkflow } from "./n8nClient.js";
 import { applyPatch, validateWorkflow, type PatchOperation } from "./patch.js";
 import { assertReadAllowed, assertWriteAllowed, backupWorkflow, isProtected } from "./safety.js";
 
@@ -62,11 +62,12 @@ export class Tools {
 
     const issues = validateWorkflow(workflow);
     if (issues.length > 0) throw new Error(`Workflow is invalid: ${issues.join("; ")}`);
-    if (options.dryRun) return { dryRun: true, wouldReplace: summarize(current), with: summarize(workflow) };
+    const warnings = droppedNodeKeyWarnings(workflow);
+    if (options.dryRun) return { dryRun: true, warnings, wouldReplace: summarize(current), with: summarize(workflow) };
 
     const backup = await backupWorkflow(this.config, current);
     const updated = await this.client.updateWorkflow(id, workflow, options.publishIfActive);
-    return { backup, workflow: updated };
+    return { backup, warnings, workflow: updated };
   }
 
   async patchWorkflow(
@@ -77,7 +78,8 @@ export class Tools {
     const current = await this.client.getWorkflow(id);
     assertWriteAllowed(this.config, current.name, options.confirmProduction);
 
-    const { workflow: patched, warnings } = applyPatch(current, operations);
+    const { workflow: patched, warnings: patchWarnings } = applyPatch(current, operations);
+    const warnings = [...patchWarnings, ...droppedNodeKeyWarnings(patched)];
     if (patched.name !== current.name) {
       assertWriteAllowed(this.config, patched.name, options.confirmProduction);
     }
