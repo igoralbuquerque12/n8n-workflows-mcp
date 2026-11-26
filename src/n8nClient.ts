@@ -25,6 +25,21 @@ export interface ListQuery {
   cursor?: string;
 }
 
+export type ExecutionStatus = "canceled" | "crashed" | "error" | "new" | "running" | "success" | "unknown" | "waiting";
+
+export interface N8nExecution extends JsonObject {
+  id: string;
+}
+
+export interface ExecutionListQuery {
+  includeData?: boolean;
+  status?: "canceled" | "error" | "running" | "success" | "waiting";
+  workflowId?: string;
+  projectId?: string;
+  limit?: number;
+  cursor?: string;
+}
+
 export class N8nApiError extends Error {
   constructor(
     readonly status: number,
@@ -229,6 +244,20 @@ export class N8nClient {
   setWorkflowTags(id: string, tagIds: string[]): Promise<{ id: string; name: string }[]> {
     return this.request("PUT", `/workflows/${encodeURIComponent(id)}/tags`, {
       body: tagIds.map((tagId) => ({ id: tagId })),
+    });
+  }
+
+  listExecutions(query: ExecutionListQuery): Promise<{ data: N8nExecution[]; nextCursor?: string | null }> {
+    return this.request("GET", "/executions", { query: { ...query } });
+  }
+
+  getExecution(id: string, includeData: boolean): Promise<N8nExecution> {
+    return this.request("GET", `/executions/${encodeURIComponent(id)}`, { query: { includeData } });
+  }
+
+  retryExecution(id: string, loadWorkflow?: boolean): Promise<N8nExecution> {
+    return this.request("POST", `/executions/${encodeURIComponent(id)}/retry`, {
+      body: loadWorkflow === undefined ? {} : { loadWorkflow },
     });
   }
 }
