@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,6 +13,8 @@ import { Tools } from "../tools.js";
 
 const TOP_LEVEL = new Set(["name", "nodes", "connections", "settings", "staticData", "description", "pinData", "nodeGroups", "projectId", "parentFolderId", "tags"]);
 const SETTINGS = new Set(["executionOrder", "timezone", "availableInMCP", "callerPolicy"]);
+// Node keys of the n8n public API node schema; anything else (e.g. the editor's rewireOutputLogTo) is rejected.
+const NODE_KEYS = new Set(["id", "name", "type", "typeVersion", "position", "parameters", "credentials", "webhookId", "disabled", "notes", "notesInFlow", "retryOnFail", "maxTries", "waitBetweenTries", "alwaysOutputData", "executeOnce", "continueOnFail", "onError"]);
 
 interface Stored extends JsonObject {
   id: string;
@@ -64,6 +66,12 @@ function startMockN8n(apiKey: string): Promise<{ server: Server; url: string; st
       const body = JSON.parse(await readBody(request)) as JsonObject;
       const extra = Object.keys(body).filter((key) => !TOP_LEVEL.has(key));
       if (extra.length > 0) return send(400, { message: `request/body must NOT have additional properties: ${extra.join(",")}` });
+      // The real API rejects description: null (as GET returns it) with this same message.
+      const nullFields = Object.keys(body).filter((key) => body[key] === null);
+      if (nullFields.length > 0) return send(400, { message: `request/body must NOT have additional properties: ${nullFields.join(",")}` });
+      const bodyNodes = (Array.isArray(body.nodes) ? body.nodes : []) as JsonObject[];
+      const badNode = bodyNodes.findIndex((node) => Object.keys(node).some((key) => !NODE_KEYS.has(key)));
+      if (badNode >= 0) return send(400, { message: `request/body/nodes/${badNode} must NOT have additional properties` });
       const badSetting = Object.keys((body.settings ?? {}) as JsonObject).filter((key) => !SETTINGS.has(key));
       if (badSetting.length > 0) return send(400, { message: `settings must NOT have additional properties: ${badSetting.join(",")}` });
 
@@ -149,6 +157,43 @@ assert.deepEqual((removed as { workflow: JsonObject }).workflow.connections, { W
 
 const roundTrip = await tools.getWorkflow(created.id);
 await tools.updateWorkflow(created.id, { ...roundTrip, settings: { ...roundTrip.settings, binaryMode: "separate" } }, {});
+
+// A workflow as the n8n editor leaves it: description: null on top, rewireOutputLogTo on a converted tool node.
+const editorExport = (): Stored => ({
+  ...baseWorkflow("[Staging] Editor export"),
+  id: "55",
+  active: false,
+  description: null,
+  nodes: [
+    ...(baseWorkflow("x").nodes as JsonObject[]),
+    { id: "3", name: "Execute_Backend_Tool", type: "n8n-nodes-base.httpRequestTool", typeVersion: 4.2, position: [400, 0], parameters: { url: "https://example.com" }, rewireOutputLogTo: "ai_tool" },
+  ],
+});
+const editorWarning = 'node "Execute_Backend_Tool": dropped editor-only key rewireOutputLogTo';
+const assertSentClean = () => {
+  const saved = n8n.store.get("55") as JsonObject;
+  assert.equal("description" in saved, false);
+  assert.equal((saved.nodes as JsonObject[]).some((node) => "rewireOutputLogTo" in node), false);
+};
+
+n8n.store.set("55", editorExport());
+const editorDry = await tools.patchWorkflow("55", [{ op: "mergeSettings", settings: { timezone: "UTC" } }], { dryRun: true });
+assert.deepEqual(editorDry.warnings, [editorWarning]);
+const editorPatch = await tools.patchWorkflow("55", [{ op: "mergeSettings", settings: { timezone: "UTC" } }], {});
+assert.deepEqual(editorPatch.warnings, [editorWarning]);
+assertSentClean();
+assert.equal(((n8n.store.get("55") as JsonObject).settings as JsonObject).timezone, "UTC");
+const editorBackup = JSON.parse(readFileSync(editorPatch.backup ?? "", "utf8")) as JsonObject;
+assert.equal(editorBackup.description, null);
+assert.equal((editorBackup.nodes as JsonObject[])[2]?.rewireOutputLogTo, "ai_tool");
+
+n8n.store.set("55", editorExport());
+const editorJson = await tools.getWorkflow("55");
+const editorUpdate = await tools.updateWorkflow("55", editorJson, {});
+assert.deepEqual(editorUpdate.warnings, [editorWarning]);
+assertSentClean();
+assert.equal((editorJson.nodes[2] as JsonObject).rewireOutputLogTo, "ai_tool");
+assert.equal(editorJson.description, null);
 
 await expectRejects(tools.createWorkflow(baseWorkflow("[Production] Flow")), /needs explicit user approval/);
 const prodCreated = await tools.createWorkflow(baseWorkflow("[Production] Flow"), true);
@@ -246,6 +291,17 @@ const okViaMcp = await client.callTool({
 });
 assert.notEqual(okViaMcp.isError, true);
 assert.equal(n8n.store.get(created.id)?.name, "[Staging] Via MCP");
+
+for (const [name, args] of [
+  ["n8n_patch_workflow", { id: "55", operations: [{ op: "setName", name: "[Staging] Editor export 2" }] }],
+  ["n8n_update_workflow", { id: "55", workflow: editorExport() }],
+] as const) {
+  n8n.store.set("55", editorExport());
+  const result = await client.callTool({ name, arguments: args });
+  assert.notEqual(result.isError, true, `${name}: ${JSON.stringify(result.content)}`);
+  assert.ok(JSON.stringify(result.content).includes("dropped editor-only key rewireOutputLogTo"), name);
+  assertSentClean();
+}
 await client.close();
 
 n8n.server.close();
