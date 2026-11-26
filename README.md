@@ -161,7 +161,10 @@ Permission rules match tool names, not arguments. A rule cannot tell a staging w
   ```
   If it starts and waits with no output, it works. Press Ctrl+C.
 - **401.** The API key or `N8N_URL` is wrong. `N8N_URL` is the base URL, without `/api/v1`.
-- **400 "must NOT have additional properties".** Your n8n version rejects a field the server sent. The n8n error message is returned in the tool result so you can see which field.
+- **400 "must NOT have additional properties".** Your n8n version rejects a field the server sent. The n8n error message is returned in the tool result so you can see which field. The server already leaves these out of what it sends:
+  - top-level fields whose value is `null` (the GET returns `description: null`, and the API rejects it);
+  - the read-only settings `binaryMode`, `engineType` and `credentialResolverId`;
+  - node keys outside the public API node schema (`id`, `name`, `type`, `typeVersion`, `position`, `parameters`, `credentials`, `webhookId`, `disabled`, `notes`, `notesInFlow`, `retryOnFail`, `maxTries`, `waitBetweenTries`, `alwaysOutputData`, `executeOnce`, `continueOnFail`, `onError`). An example is `rewireOutputLogTo`, which the editor adds to converted tool nodes. Update and patch report each dropped key in `warnings`, for example `node "Execute_Backend_Tool": dropped editor-only key rewireOutputLogTo`. Backups keep the full original JSON.
 - **"Missing configuration" with a `.env` that looks right (Windows).** The file has a UTF-8 BOM. Rewrite it with `Set-Content -Encoding ascii` (see Configure).
 
 ## Updating

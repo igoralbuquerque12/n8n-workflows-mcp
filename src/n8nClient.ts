@@ -64,11 +64,37 @@ const UPDATE_FIELDS = [
 // The API documents these settings as derived or ignored on write; older versions reject them as unknown properties.
 const READ_ONLY_SETTINGS = ["binaryMode", "engineType", "credentialResolverId"];
 
+// Node keys in the public API node schema. The editor adds others (e.g. rewireOutputLogTo on converted tool nodes)
+// that the API rejects with "request/body/nodes/<i> must NOT have additional properties".
+export const NODE_FIELDS = [
+  "id",
+  "name",
+  "type",
+  "typeVersion",
+  "position",
+  "parameters",
+  "credentials",
+  "webhookId",
+  "disabled",
+  "notes",
+  "notesInFlow",
+  "retryOnFail",
+  "maxTries",
+  "waitBetweenTries",
+  "alwaysOutputData",
+  "executeOnce",
+  "continueOnFail",
+  "onError",
+] as const;
+
+const NODE_FIELD_SET = new Set<string>(NODE_FIELDS);
+
+// Null top-level values (e.g. description: null from GET) are rejected by the API, so they are not sent.
 function pick(source: JsonObject, fields: readonly string[]): JsonObject {
   const out: JsonObject = {};
   for (const field of fields) {
     const value = source[field];
-    if (value !== undefined) out[field] = value;
+    if (value !== undefined && value !== null) out[field] = value;
   }
   return out;
 }
@@ -79,15 +105,42 @@ function sanitizeSettings(settings: Json | undefined): JsonObject {
   return copy;
 }
 
+function isObject(value: Json | undefined): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sanitizeNodes(nodes: Json): Json {
+  if (!Array.isArray(nodes)) return nodes;
+  return nodes.map((node) =>
+    isObject(node) ? Object.fromEntries(Object.entries(node).filter(([key]) => NODE_FIELD_SET.has(key))) : node,
+  );
+}
+
+/** Warnings for node keys that toCreateBody/toUpdateBody will not send. */
+export function droppedNodeKeyWarnings(workflow: JsonObject): string[] {
+  const nodes = Array.isArray(workflow.nodes) ? workflow.nodes : [];
+  const warnings: string[] = [];
+  for (const node of nodes) {
+    if (!isObject(node)) continue;
+    const dropped = Object.keys(node).filter((key) => !NODE_FIELD_SET.has(key));
+    if (dropped.length > 0) {
+      warnings.push(`node "${String(node.name)}": dropped editor-only key${dropped.length > 1 ? "s" : ""} ${dropped.join(", ")}`);
+    }
+  }
+  return warnings;
+}
+
 export function toCreateBody(workflow: JsonObject): JsonObject {
   const body = pick(workflow, CREATE_FIELDS);
   body.settings = sanitizeSettings(body.settings);
+  if (body.nodes !== undefined) body.nodes = sanitizeNodes(body.nodes);
   return body;
 }
 
 export function toUpdateBody(workflow: JsonObject): JsonObject {
   const body = pick(workflow, UPDATE_FIELDS);
   body.settings = sanitizeSettings(body.settings);
+  if (body.nodes !== undefined) body.nodes = sanitizeNodes(body.nodes);
   return body;
 }
 
